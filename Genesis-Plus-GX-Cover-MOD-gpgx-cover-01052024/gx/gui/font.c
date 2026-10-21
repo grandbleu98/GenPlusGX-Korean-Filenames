@@ -56,6 +56,9 @@ static GXTexObj fontTexObj;
 static void *ipl_fontarea;
 static sys_fontheader *fontHeader;
 static u8 font_size[256];
+static u8 *hangulTexture;
+static GXTexObj hangulTexObj;
+#include "font_korean.h"
 
 #ifndef HW_RVL
 
@@ -242,6 +245,67 @@ static void DrawChar(unsigned char c, int xpos, int ypos, int size, GXColor colo
  ****************************************************************************/
 extern void __SYS_ReadROM(void *buf,u32 len,u32 offset);
 
+/* Decode one UTF-8 codepoint; malformed sequences fall back to the first byte. */
+static unsigned int FONT_NextCodepoint(const unsigned char **s)
+{
+  const unsigned char *p = *s;
+  unsigned int cp;
+  if (p[0] < 0x80) { *s = p + 1; return p[0]; }
+  if ((p[0] & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80)
+  { cp = ((p[0] & 0x1F) << 6) | (p[1] & 0x3F); *s = p + 2; return cp; }
+  if ((p[0] & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80)
+  { cp = ((p[0] & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F); *s = p + 3; return cp; }
+  if ((p[0] & 0xF8) == 0xF0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80)
+  { cp = ((p[0] & 7) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F); *s = p + 4; return cp; }
+  *s = p + 1;
+  return p[0];
+}
+
+static int FONT_CodepointWidth(unsigned int cp, int size)
+{
+  if (cp >= 0xAC00 && cp <= 0xD7A3) return size;
+  if (cp < 256) return (font_size[cp] * size * vmode->fbWidth) / (fontHeader->cell_height * vmode->viWidth);
+  return (font_size[fontHeader->inval_char] * size * vmode->fbWidth) / (fontHeader->cell_height * vmode->viWidth);
+}
+
+static void FONT_DrawHangul(unsigned int cp, int xpos, int ypos, int size, GXColor color)
+{
+  unsigned int idx = cp - 0xAC00;
+  const unsigned char *glyph = gx_hangul_16x16[idx];
+  int x, y;
+  /* Convert 1bpp rows into GX tiled I4 texture layout (16x16 = 128 bytes). */
+  memset(hangulTexture, 0, 128);
+  for (y = 0; y < 16; ++y)
+  for (x = 0; x < 16; ++x)
+  {
+    unsigned char bit = (glyph[y * 2 + (x >> 3)] >> (7 - (x & 7))) & 1;
+    unsigned int off = ((y >> 3) * 64) + ((x >> 3) * 32) + ((x & 7) >> 1) + ((y & 7) << 2);
+    if (bit) hangulTexture[off] |= ((x & 1) ? 0x0F : 0xF0);
+  }
+  DCStoreRange(hangulTexture, 128);
+  GX_InvalidateTexAll();
+  GX_LoadTexObj(&hangulTexObj, GX_TEXMAP0);
+  size = (size * vmode->efbHeight) / 480;
+  GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+  GX_Position2s16(xpos, ypos - size); GX_Color4u8(color.r,color.g,color.b,0xff); GX_TexCoord2f32(0,0);
+  GX_Position2s16(xpos + size, ypos - size); GX_Color4u8(color.r,color.g,color.b,0xff); GX_TexCoord2f32(1,0);
+  GX_Position2s16(xpos + size, ypos); GX_Color4u8(color.r,color.g,color.b,0xff); GX_TexCoord2f32(1,1);
+  GX_Position2s16(xpos, ypos); GX_Color4u8(color.r,color.g,color.b,0xff); GX_TexCoord2f32(0,1);
+  GX_End();
+  GX_DrawDone();
+}
+
+static void FONT_DrawCodepoint(unsigned int cp, int x, int y, int size, GXColor color)
+{
+  if (cp >= 0xAC00 && cp <= 0xD7A3)
+    FONT_DrawHangul(cp, x, y, size, color);
+  else
+  {
+    GX_LoadTexObj(&fontTexObj, GX_TEXMAP0);
+    DrawChar((unsigned char)(cp < 256 ? cp : fontHeader->inval_char), x, y, size, color);
+  }
+}
+
 int FONT_Init(void)
 {
 #ifndef HW_RVL
@@ -289,6 +353,20 @@ int FONT_Init(void)
   /* initialize texture object */
   GX_InitTexObj(&fontTexObj, fontTexture, fontHeader->cell_width, fontHeader->cell_height, GX_TF_I4, GX_CLAMP, GX_CLAMP, GX_FALSE);
 
+  /* Dedicated 16x16 texture for UTF-8 Hangul syllables. */
+  hangulTexture = memalign(32, 128);
+  if (!hangulTexture)
+  {
+    free(fontTexture);
+    free(ipl_fontarea);
+    fontTexture = NULL;
+    ipl_fontarea = NULL;
+    fontHeader = NULL;
+    return 0;
+  }
+  memset(hangulTexture, 0, 128);
+  GX_InitTexObj(&hangulTexObj, hangulTexture, 16, 16, GX_TF_I4, GX_CLAMP, GX_CLAMP, GX_FALSE);
+
   return 1;
 }
 
@@ -298,108 +376,74 @@ void FONT_Shutdown(void)
     free(ipl_fontarea);
   if (fontTexture)
     free(fontTexture);
+  if (hangulTexture)
+    free(hangulTexture);
 }
 
 int FONT_write(char *string, int size, int x, int y, int max_width, GXColor color)
 {
-  int w, ox;
-
-  GX_LoadTexObj(&fontTexObj, GX_TEXMAP0);
-
+  int w;
+  const unsigned char *p = (const unsigned char *)string;
   x -= (vmode->fbWidth / 2);
   y -= (vmode->efbHeight / 2);
-
-  ox = x;
-
-  while (*string)
+  int ox = x;
+  GX_LoadTexObj(&fontTexObj, GX_TEXMAP0);
+  while (*p)
   {
-    if (*string == '\n')
-    {
-      x = ox;
-      y += size;
-    }
-    else
-    {
-      w = (font_size[(u8)*string] * size * vmode->fbWidth) / (fontHeader->cell_height * vmode->viWidth);
-      if ((x + w) > (ox + max_width)) return strlen(string);
-      DrawChar(*string, x, y, size,color);
-      x += w;
-    }
-    string++;
+    unsigned int cp = FONT_NextCodepoint(&p);
+    if (cp == '\n') { x = ox; y += size; continue; }
+    w = FONT_CodepointWidth(cp, size);
+    if ((x + w) > (ox + max_width)) return (int)strlen((const char *)p);
+    FONT_DrawCodepoint(cp, x, y, size, color);
+    x += w;
   }
- 
   return 0;
 }
 
 int FONT_writeCenter(char *string, int size, int x1, int x2, int y, GXColor color)
 {
-  int x;
-  int i = 0;
-  int w = 0;
-
-  GX_LoadTexObj(&fontTexObj, GX_TEXMAP0);
-
-  while (string[i] && (string[i] != '\n'))
-  {
-    w += (font_size[(u8)string[i++]] * size * vmode->fbWidth) / (fontHeader->cell_height * vmode->viWidth);
-  }
-
-  if ((x1 + w) > x2) w = x2 - x1;
-  x = x1 + (x2 - x1 - w - vmode->fbWidth) / 2;
+  const unsigned char *p;
+  int w, total = 0, x;
+  p = (const unsigned char *)string;
+  while (*p && *p != '\n') total += FONT_CodepointWidth(FONT_NextCodepoint(&p), size);
+  if ((x1 + total) > x2) total = x2 - x1;
+  x = x1 + (x2 - x1 - total - vmode->fbWidth) / 2;
   x2 -= (vmode->fbWidth / 2);
-  y  -= (vmode->efbHeight / 2);
-
-  while (*string && (*string != '\n'))
+  y -= (vmode->efbHeight / 2);
+  p = (const unsigned char *)string;
+  GX_LoadTexObj(&fontTexObj, GX_TEXMAP0);
+  while (*p && *p != '\n')
   {
-    w = (font_size[(u8)*string] * size * vmode->fbWidth) / (fontHeader->cell_height * vmode->viWidth);
-    if ((x + w) > x2) return strlen(string);
-    DrawChar(*string, x, y, size,color);
+    unsigned int cp = FONT_NextCodepoint(&p);
+    w = FONT_CodepointWidth(cp, size);
+    if ((x + w) > x2) return (int)strlen((const char *)p);
+    FONT_DrawCodepoint(cp, x, y, size, color);
     x += w;
-    string++;
   }
-
-  if (*string == '\n')
-  {
-    string++;
-    return FONT_writeCenter(string, size, x1, x2 + (vmode->fbWidth / 2), y + size + (vmode->efbHeight / 2), color);
-  }
-
+  if (*p == '\n') return FONT_writeCenter((char *)(p + 1), size, x1, x2 + (vmode->fbWidth / 2), y + size + (vmode->efbHeight / 2), color);
   return 0;
 }
 
 int FONT_alignRight(char *string, int size, int x, int y, GXColor color)
 {
-  int ox;
-  int i = 0;
-  int w = 0;
-
-  GX_LoadTexObj(&fontTexObj, GX_TEXMAP0);
-
-  while (string[i] && (string[i] != '\n'))
-  {
-    w += (font_size[(u8)string[i++]] * size * vmode->fbWidth) / (fontHeader->cell_height * vmode->viWidth);
-  }
-
+  const unsigned char *p;
+  int total = 0, w, ox;
+  p = (const unsigned char *)string;
+  while (*p && *p != '\n') total += FONT_CodepointWidth(FONT_NextCodepoint(&p), size);
   x -= (vmode->fbWidth / 2);
   y -= (vmode->efbHeight / 2);
-
   ox = x;
-  x -= w;
-
-  while (*string && (*string != '\n'))
+  x -= total;
+  p = (const unsigned char *)string;
+  GX_LoadTexObj(&fontTexObj, GX_TEXMAP0);
+  while (*p && *p != '\n')
   {
-    w = (font_size[(u8)*string] * size * vmode->fbWidth) / (fontHeader->cell_height * vmode->viWidth);
-    if ((x + w) > ox) return strlen(string);
-    DrawChar(*string, x, y, size,color);
+    unsigned int cp = FONT_NextCodepoint(&p);
+    w = FONT_CodepointWidth(cp, size);
+    if ((x + w) > ox) return (int)strlen((const char *)p);
+    FONT_DrawCodepoint(cp, x, y, size, color);
     x += w;
-    string++;
   }
-
-  if (*string == '\n')
-  {
-    string++;
-    return FONT_alignRight(string, size, ox + (vmode->fbWidth / 2), y + size + (vmode->efbHeight / 2), color);
-  }
-
+  if (*p == '\n') return FONT_alignRight((char *)(p + 1), size, ox + (vmode->fbWidth / 2), y + size + (vmode->efbHeight / 2), color);
   return 0;
 }
